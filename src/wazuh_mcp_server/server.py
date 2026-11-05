@@ -2140,7 +2140,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Free-text search query (AND, OR, NOT, quoted phrases, trailing-* prefix; leading wildcards, regex, and field:value are not supported — use the structured filter parameters instead). Searched across all alert fields via Elasticsearch simple_query_string.",
+                        "description": "Free-text search query (AND, OR, NOT, quoted phrases, trailing-* prefix; leading wildcards, regex, and field:value are not supported — use the structured filter parameters instead). Searched across all alert fields via Elasticsearch simple_query_string; if that exceeds the indexer's clause limit, retried over the main text fields (full_log, rule.description, agent.name, location, ...).",
                     },
                     "time_range": {
                         "type": "string",

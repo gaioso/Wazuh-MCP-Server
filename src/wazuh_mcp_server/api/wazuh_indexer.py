@@ -43,6 +43,93 @@ def _to_simple_query_syntax(query: str) -> str:
     return "".join(parts)
 
 
+# Root-cause types the indexer reports for a query it refused to run. OpenSearch wraps some of
+# them (notably too_many_clauses) in an HTTP 500 search_phase_execution_exception, but the cause
+# is the request, not the cluster: retrying it or counting it as an outage is wrong.
+_QUERY_ERROR_TYPES = frozenset(
+    {
+        "too_many_clauses",
+        "too_many_nested_clauses",
+        "query_shard_exception",
+        "parse_exception",
+        "x_content_parse_exception",
+        "search_parse_exception",
+        "parsing_exception",
+        "number_format_exception",
+    }
+)
+
+# Fields searched by free-text queries when searching every field of the alerts mapping expands
+# past indices.query.bool.max_clause_count (default 1024): wazuh-alerts-* maps hundreds of fields,
+# so even a few OR'd terms across "*" overflow it.
+FREE_TEXT_FALLBACK_FIELDS = [
+    "full_log",
+    "rule.description",
+    "rule.groups",
+    "rule.mitre.technique",
+    "agent.name",
+    "location",
+    "decoder.name",
+    "syscheck.path",
+    "data.srcuser",
+    "data.dstuser",
+    "data.url",
+    "data.command",
+    "data.win.system.message",
+]
+
+
+class IndexerQueryError(ValueError):
+    """The indexer answered but rejected the query itself (bad or too-broad request).
+
+    Marked _service_alive so the circuit breaker counts it as proof of liveness rather than a
+    failure, and a ValueError so the tenacity retry layer (httpx exceptions only) skips it.
+    """
+
+    _service_alive = True
+
+    def __init__(self, reason: str, status_code: int):
+        self.reason = reason
+        self.status_code = status_code
+        super().__init__(f"Indexer rejected the query ({reason}, HTTP {status_code})")
+
+
+def _query_error_reason(response: httpx.Response) -> Optional[str]:
+    """Return the root-cause type if every root cause of an indexer error is a query error."""
+    try:
+        error = response.json().get("error")
+    except (json.JSONDecodeError, ValueError, AttributeError):
+        return None
+    if not isinstance(error, dict):
+        return None
+    root_causes = error.get("root_cause") or []
+    types = {rc.get("type") for rc in root_causes if isinstance(rc, dict)}
+    if not types:
+        caused_by = error.get("caused_by")
+        types = {caused_by.get("type")} if isinstance(caused_by, dict) else set()
+    if types and types <= _QUERY_ERROR_TYPES:
+        return sorted(types)[0]
+    return None
+
+
+def _raise_for_indexer_status(e: httpx.HTTPStatusError, what: str) -> None:
+    """Translate an indexer HTTP error; re-raise only genuine server failures for retry."""
+    status = e.response.status_code
+    reason = _query_error_reason(e.response)
+    if reason:
+        logger.warning(f"Indexer {what} rejected the query: {status} {reason}")
+        raise IndexerQueryError(reason, status) from e
+    logger.error(f"Indexer {what} failed: {status} - {e.response.text}")
+    if status in (401, 403):
+        raise ValueError(
+            f"Wazuh Indexer authentication failed (HTTP {status}). Check WAZUH_INDEXER_USER / WAZUH_INDEXER_PASS."
+        )
+    if status >= 500:
+        # Let server errors propagate so tenacity retry and the circuit breaker see them
+        raise e
+    raise ValueError(f"Indexer query failed: {status}")
+
+
 class WazuhIndexerClient:
     """
     Client for querying the Wazuh Indexer (Elasticsearch/OpenSearch).
@@ -230,16 +317,7 @@ class WazuhIndexerClient:
                 raise ValueError(f"Invalid JSON response from Wazuh Indexer: {index}")
 
         except httpx.HTTPStatusError as e:
-            logger.error(f"Indexer search failed: {e.response.status_code} - {e.response.text}")
-            if e.response.status_code in (401, 403):
-                raise ValueError(
-                    "Wazuh Indexer authentication failed (HTTP "
-                    f"{e.response.status_code}). Check WAZUH_INDEXER_USER / WAZUH_INDEXER_PASS."
-                )
-            if e.response.status_code >= 500:
-                # Let server errors propagate so tenacity retry can see them
-                raise
-            raise ValueError(f"Indexer query failed: {e.response.status_code}")
+            _raise_for_indexer_status(e, "search")
         except httpx.ConnectError:
             # Let connection errors propagate for retry
             raise
@@ -264,10 +342,7 @@ class WazuhIndexerClient:
             except (json.JSONDecodeError, ValueError):
                 raise ValueError(f"Invalid JSON response from Wazuh Indexer: {index}")
         except httpx.HTTPStatusError as e:
-            logger.error(f"Indexer aggregation failed: {e.response.status_code} - {e.response.text}")
-            if e.response.status_code >= 500:
-                raise
-            raise ValueError(f"Indexer query failed: {e.response.status_code}")
+            _raise_for_indexer_status(e, "aggregation")
         except (httpx.ConnectError, httpx.TimeoutException):
             raise
 
@@ -419,16 +494,15 @@ class WazuhIndexerClient:
             # denial-of-service from authenticated read users. AND/OR/NOT, quoted phrases,
             # and trailing-wildcard prefixes remain supported.
             qt = _to_simple_query_syntax(query_text.strip().lstrip("*?"))  # no leading wildcard
-            must_clauses.append(
-                {
-                    "simple_query_string": {
-                        "query": qt,
-                        "default_operator": "AND",
-                        "flags": "AND|OR|NOT|PHRASE|PREFIX|WHITESPACE",
-                        "lenient": True,
-                    }
-                }
-            )
+            free_text: Optional[Dict[str, Any]] = {
+                "query": qt,
+                "default_operator": "AND",
+                "flags": "AND|OR|NOT|PHRASE|PREFIX|WHITESPACE",
+                "lenient": True,
+            }
+            must_clauses.append({"simple_query_string": free_text})
+        else:
+            free_text = None
 
         if must_clauses:
             query = {"bool": {"must": must_clauses}}
@@ -436,7 +510,17 @@ class WazuhIndexerClient:
             query = {"match_all": {}}
 
         # Use _search helper for consistent retry logic (sorted by timestamp desc)
-        result = await self._search(ALERTS_INDEX, query, size=limit, sort=[{"timestamp": {"order": "desc"}}])
+        sort = [{"timestamp": {"order": "desc"}}]
+        try:
+            result = await self._search(ALERTS_INDEX, query, size=limit, sort=sort)
+        except IndexerQueryError as e:
+            # Searching every mapped field overflowed max_clause_count: retry once over the
+            # fields that carry alert text instead of failing the whole search.
+            if free_text is None or e.reason not in ("too_many_clauses", "too_many_nested_clauses"):
+                raise
+            logger.info("Free-text alert search exceeded max_clause_count; retrying on fallback fields")
+            free_text["fields"] = FREE_TEXT_FALLBACK_FIELDS
+            result = await self._search(ALERTS_INDEX, query, size=limit, sort=sort)
 
         # Transform to standard Wazuh format
         hits = result.get("hits", {})

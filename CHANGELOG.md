@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Bad indexer queries no longer open the circuit breaker.** OpenSearch answers a free-text search that expands past `max_clause_count` (e.g. `200 OR 301 OR 302 OR 500` across every field of `wazuh-alerts-*`) with HTTP 500 `too_many_clauses`. The client retried it three times and counted each as an outage, so a handful of such searches opened the breaker and every alert tool returned `503 circuit breaker open` for at least 60 s while the indexer was healthy. Indexer errors whose root causes are all query errors (`too_many_clauses`, `parse_exception`, `query_shard_exception`, …) now raise `IndexerQueryError`: not retried, and counted as proof of liveness. Free-text alert searches that overflow the clause limit are retried once over a bounded field list (`full_log`, `rule.description`, `agent.name`, …).
+
 ## [5.0.0] - 2026-09-24
 
 Security and correctness release. Several defaults change and can stop an existing 4.x deployment from working until you act: the Manager certificate is verified, OAuth requires sign-in, write tools need `confirm=true` in production, bearer tokens must be re-minted once, and startup refuses invalid settings. Read [UPGRADING.md](https://github.com/gensecaihq/Wazuh-MCP-Server/blob/main/UPGRADING.md#upgrading-to-500) before upgrading.
